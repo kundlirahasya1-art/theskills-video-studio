@@ -1,0 +1,10 @@
+{
+  "name": "KundliRahasya",
+  "site": "kundlirahasya.com",
+  "font": "Kohinoor Devanagari",
+  "caption_size": 62,
+  "bg": "#2B1055",
+  "fg": "#FFE9A8",
+  "outline": "#000000",
+  "note": "Rang/font apne hisaab se badlo. Hindi ke liye Devanagari font chahiye (Mac: Kohinoor Devanagari)."
+}

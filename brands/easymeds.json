@@ -1,0 +1,10 @@
+{
+  "name": "EasyMeds",
+  "site": "easymeds.ind.in",
+  "font": "Kohinoor Devanagari",
+  "caption_size": 62,
+  "bg": "#0F766E",
+  "fg": "#FFFFFF",
+  "outline": "#06302D",
+  "note": "Rang/font apne hisaab se badlo."
+}

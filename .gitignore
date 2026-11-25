@@ -1,0 +1,10 @@
+input/*
+output/*
+!input/.gitkeep
+!output/.gitkeep
+__pycache__/
+.DS_Store
+*.mp4
+*.mov
+*.mp3
+*.wav

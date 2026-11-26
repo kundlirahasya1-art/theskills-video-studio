@@ -51,16 +51,19 @@ def ass_color(hexcol):
     return f"&H00{b}{g}{r}".upper()
 
 
-def style(brand, w, h, big=False):
-    """ASS style. libass treats SRT as a 288-line-high canvas, so convert pixels -> that space."""
+def style(brand, w, h, big=False, align=None, mult=None, margin_frac=None):
+    """ASS style. libass treats SRT as a 288-line-high canvas, so convert pixels -> that space.
+    Alignment (SSA numbering): 2 bottom, 6 top, 10 middle."""
     k = 288 / h
-    px = brand.get("caption_size", 62) * (1.45 if big else 1.0) * (min(w, h) / 1080)
-    margin_px = 0 if big else h * 0.14
+    m = mult if mult else (1.45 if big else 1.0)
+    px = brand.get("caption_size", 62) * m * (min(w, h) / 1080)
+    mf = margin_frac if margin_frac is not None else (0 if big else 0.14)
+    al = align if align else (10 if big else 2)
     return (f"FontName={brand.get('font','Arial')},FontSize={px * k:.1f},Bold=1,"
             f"PrimaryColour={ass_color(brand.get('fg','#FFFFFF'))},"
             f"OutlineColour={ass_color(brand.get('outline','#000000'))},"
-            f"BorderStyle=1,Outline=1.4,Shadow=0.6,Alignment={10 if big else 2},"
-            f"MarginV={margin_px * k:.0f},MarginL={int(w * 0.06 * k)},MarginR={int(w * 0.06 * k)}")
+            f"BorderStyle=1,Outline=1.4,Shadow=0.6,Alignment={al},"
+            f"MarginV={h * mf * k:.0f},MarginL={int(w * 0.06 * k)},MarginR={int(w * 0.06 * k)}")
 
 
 # ---------- captions ----------
@@ -102,44 +105,99 @@ def resolve_captions(arg, total):
 
 
 # ---------- final mux ----------
-def finish(video, out, total, w, h, brand, voice=None, music=None, srt=None, big_captions=False, music_vol=0.12):
+GRADES = {
+    "warm":   "eq=contrast=1.06:saturation=1.18,colorbalance=rs=0.06:gs=0.01:bs=-0.06:rm=0.04:bm=-0.04",
+    "cinema": "eq=contrast=1.14:saturation=0.92:gamma=0.96,colorbalance=rs=-0.03:bs=0.05:rh=0.05:bh=-0.03,vignette=PI/5",
+    "bright": "eq=brightness=0.04:contrast=1.05:saturation=1.22",
+    "punch":  "eq=contrast=1.12:saturation=1.3,unsharp=5:5:0.6",
+}
+LOGO_POS = {"br": "W-w-40:H-h-40", "bl": "40:H-h-40", "tr": "W-w-40:40", "tl": "40:40"}
+
+
+def fx_from(a, brand=None):
+    """Collect the 'professional' options from CLI args."""
+    cta = getattr(a, "cta", None)
+    if cta == "site" and brand:
+        cta = brand.get("site", "")
+    return {"grade": getattr(a, "grade", None), "logo": getattr(a, "logo", None),
+            "logo_pos": getattr(a, "logo_pos", "br"), "logo_size": getattr(a, "logo_size", 0.2),
+            "hook": getattr(a, "hook", None), "cta": cta,
+            "fade": getattr(a, "fade", False), "normalize": getattr(a, "normalize", False)}
+
+
+def finish(video, out, total, w, h, brand, voice=None, music=None, srt=None, big_captions=False,
+           music_vol=0.12, fx=None):
     need("ffmpeg")
+    fx = fx or {}
     tmp = Path(tempfile.mkdtemp(prefix="vs_"))
     try:
-        vin = tmp / "in.mp4"
-        shutil.copy(video, vin)
+        shutil.copy(video, tmp / "in.mp4")
         cmd = ["ffmpeg", "-y", "-i", "in.mp4"]
         idx = 1
-        voice_i = music_i = None
+        voice_i = music_i = logo_i = None
         if voice:
-            shutil.copy(voice, tmp / "voice" ); cmd += ["-i", "voice"]; voice_i = idx; idx += 1
+            shutil.copy(voice, tmp / "voice"); cmd += ["-i", "voice"]; voice_i = idx; idx += 1
         if music:
             shutil.copy(music, tmp / "music"); cmd += ["-stream_loop", "-1", "-i", "music"]; music_i = idx; idx += 1
-        vf = []
+        if fx.get("logo"):
+            if not Path(fx["logo"]).exists():
+                sys.exit(f"Logo file nahi mili: {fx['logo']}")
+            shutil.copy(fx["logo"], tmp / "logo.png"); cmd += ["-loop", "1", "-i", "logo.png"]; logo_i = idx; idx += 1
+
+        fc, cur = [], "0:v"
+        # --- video chain: grade + fades, logo, then text on top ---
+        pre = []
+        if fx.get("grade"):
+            if fx["grade"] not in GRADES:
+                sys.exit(f"Grade options: {', '.join(GRADES)}")
+            pre.append(GRADES[fx["grade"]])
+        if fx.get("fade"):
+            pre.append(f"fade=t=in:st=0:d=0.4,fade=t=out:st={max(total - 0.5, 0):.2f}:d=0.5")
+        if pre:
+            fc.append(f"[{cur}]{','.join(pre)}[v1]"); cur = "v1"
+        if logo_i:
+            fc.append(f"[{logo_i}:v]scale={int(w * fx.get('logo_size', 0.2))}:-1[lg]")
+            fc.append(f"[{cur}][lg]overlay={LOGO_POS.get(fx.get('logo_pos', 'br'), LOGO_POS['br'])}[v2]"); cur = "v2"
+        subs = []
         if srt:
             (tmp / "subs.srt").write_text(srt, encoding="utf-8")
-            vf.append(f"subtitles=subs.srt:force_style='{style(brand, w, h, big_captions)}'")
-        cmd += ["-filter_complex"]
-        fc = []
-        vlabel = "0:v"
-        if vf:
-            fc.append(f"[0:v]{','.join(vf)}[v]"); vlabel = "v"
-        alabel = None
+            subs.append(f"subtitles=subs.srt:force_style='{style(brand, w, h, big_captions)}'")
+        if fx.get("hook"):
+            end = min(2.8, max(total / 2, 0.8))
+            (tmp / "hook.srt").write_text(f"1\n{ts(0.2)} --> {ts(end)}\n{fx['hook']}\n", encoding="utf-8")
+            subs.append(f"subtitles=hook.srt:force_style='{style(brand, w, h, align=6, mult=1.5, margin_frac=0.12)}'")
+        if fx.get("cta"):
+            start = max(total - 3.2, total / 2)
+            (tmp / "cta.srt").write_text(f"1\n{ts(start)} --> {ts(total)}\n{fx['cta']}\n", encoding="utf-8")
+            subs.append(f"subtitles=cta.srt:force_style='{style(brand, w, h, align=2, mult=1.35, margin_frac=0.22)}'")
+        if subs:
+            fc.append(f"[{cur}]{','.join(subs)}[v3]"); cur = "v3"
+
+        # --- audio chain ---
+        alabel, a_filter = None, False
         if voice_i and music_i:
-            fc.append(f"[{voice_i}:a]volume=1.0[va];[{music_i}:a]volume={music_vol}[ma];[va][ma]amix=inputs=2:duration=first:normalize=0[a]"); alabel = "a"
+            fc.append(f"[{voice_i}:a]volume=1.0[va];[{music_i}:a]volume={music_vol}[ma];"
+                      f"[va][ma]amix=inputs=2:duration=first:normalize=0[a]"); alabel, a_filter = "a", True
         elif voice_i:
             alabel = f"{voice_i}:a"
         elif music_i:
-            fc.append(f"[{music_i}:a]volume={music_vol * 3}[a]"); alabel = "a"
-        cmd += [";".join(fc) if fc else "null"]
-        cmd += ["-map", f"[{vlabel}]" if vlabel == "v" else "0:v"]
+            fc.append(f"[{music_i}:a]volume={music_vol * 3}[a]"); alabel, a_filter = "a", True
         if alabel:
-            cmd += ["-map", f"[{alabel}]" if alabel == "a" else alabel, "-c:a", "aac", "-b:a", "192k"]
+            post = []
+            if fx.get("normalize"):
+                post.append("loudnorm=I=-16:TP=-1.5:LRA=11")
+            if fx.get("fade"):
+                post.append(f"afade=t=in:st=0:d=0.4,afade=t=out:st={max(total - 0.5, 0):.2f}:d=0.5")
+            if post:
+                fc.append(f"[{alabel}]{','.join(post)}[af]"); alabel, a_filter = "af", True
+
+        if fc:
+            cmd += ["-filter_complex", ";".join(fc)]
+        cmd += ["-map", f"[{cur}]" if cur != "0:v" else "0:v"]
+        if alabel:
+            cmd += ["-map", f"[{alabel}]" if a_filter else alabel, "-c:a", "aac", "-b:a", "192k"]
         cmd += ["-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-pix_fmt", "yuv420p",
                 "-t", f"{total:.3f}", "-movflags", "+faststart", str(Path(out).resolve())]
-        # if no filter at all, drop the dummy -filter_complex
-        if not fc:
-            i = cmd.index("-filter_complex"); del cmd[i:i + 2]
         run(cmd, cwd=tmp)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
@@ -180,7 +238,7 @@ def cmd_slideshow(a):
         listf.write_text("\n".join(lines))
         joined = tmp / "joined.mp4"
         run(["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", str(listf), "-c", "copy", str(joined)])
-        finish(joined, a.out, total, w, h, brand, a.voice, a.music, resolve_captions(a.captions, total))
+        finish(joined, a.out, total, w, h, brand, a.voice, a.music, resolve_captions(a.captions, total), fx=fx_from(a, brand))
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
@@ -196,16 +254,34 @@ def cmd_reel(a):
             vf = f"scale={w}:{h}:force_original_aspect_ratio=increase,crop={w}:{h},fps={FPS},format=yuv420p"
             run(["ffmpeg", "-y", "-i", clip, "-an", "-vf", vf, "-c:v", "libx264", "-preset", "veryfast", "-crf", "20", str(o)])
             lines.append(f"file '{o}'")
-        (tmp / "list.txt").write_text("\n".join(lines))
         joined = tmp / "joined.mp4"
-        run(["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", str(tmp / "list.txt"), "-c", "copy", str(joined)])
+        paths = [tmp / f"c{i}.mp4" for i in range(len(a.clips))]
+        if a.xfade > 0 and len(paths) > 1:
+            durs = [duration(p) for p in paths]
+            x = min(a.xfade, min(durs) / 2 - 0.05)
+            if x < a.xfade:
+                print(f"Note: clip chhoti hai, transition {x:.2f} sec rakha.")
+            fcx, prev, acc = [], "0:v", 0.0
+            for k in range(1, len(paths)):
+                acc += durs[k - 1]
+                lbl = f"x{k}"
+                fcx.append(f"[{prev}][{k}:v]xfade=transition={a.transition}:duration={x:.3f}:offset={acc - k * x:.3f}[{lbl}]")
+                prev = lbl
+            cmdx = ["ffmpeg", "-y"]
+            for p in paths:
+                cmdx += ["-i", str(p)]
+            run(cmdx + ["-filter_complex", ";".join(fcx), "-map", f"[{prev}]", "-c:v", "libx264",
+                        "-preset", "veryfast", "-crf", "20", "-pix_fmt", "yuv420p", str(joined)])
+        else:
+            (tmp / "list.txt").write_text("\n".join(lines))
+            run(["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", str(tmp / "list.txt"), "-c", "copy", str(joined)])
         total = duration(a.voice) if a.voice else duration(joined)
         # if voice is longer than video, loop the video to cover it
         if duration(joined) < total:
             looped = tmp / "looped.mp4"
             run(["ffmpeg", "-y", "-stream_loop", "-1", "-i", str(joined), "-t", f"{total:.3f}", "-c", "copy", str(looped)])
             joined = looped
-        finish(joined, a.out, total, w, h, brand, a.voice, a.music, resolve_captions(a.captions, total))
+        finish(joined, a.out, total, w, h, brand, a.voice, a.music, resolve_captions(a.captions, total), fx=fx_from(a, brand))
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
@@ -224,7 +300,7 @@ def cmd_textcards(a):
         col = brand.get("bg", "#101828").lstrip("#")
         run(["ffmpeg", "-y", "-f", "lavfi", "-i", f"color=c=0x{col}:s={w}x{h}:r={FPS}:d={total:.3f}",
              "-c:v", "libx264", "-pix_fmt", "yuv420p", str(bg)])
-        finish(bg, a.out, total, w, h, brand, a.voice, a.music, srt, big_captions=True)
+        finish(bg, a.out, total, w, h, brand, a.voice, a.music, srt, big_captions=True, fx=fx_from(a, brand))
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
@@ -261,10 +337,21 @@ def main():
         s.add_argument("--brand", help="brands/<naam>.json (kundlirahasya, easymeds, theskills)")
         s.add_argument("--aspect", default="9:16", choices=ASPECTS)
         s.add_argument("--out", default="output/video.mp4")
+        s.add_argument("--grade", choices=list(GRADES), help="color look: warm / cinema / bright / punch")
+        s.add_argument("--logo", help="logo.png (transparent best) watermark")
+        s.add_argument("--logo-pos", default="br", choices=list(LOGO_POS), help="br/bl/tr/tl")
+        s.add_argument("--logo-size", type=float, default=0.2, help="logo width, frame ka fraction (0.2)")
+        s.add_argument("--hook", help="shuru ke 2.5 sec me upar bada text")
+        s.add_argument("--cta", help="aakhir ke 3 sec ka text; 'site' likho to brand ki website")
+        s.add_argument("--fade", action="store_true", help="shuru/ant me fade in-out")
+        s.add_argument("--normalize", action="store_true", help="awaaz ki loudness barabar (-16 LUFS)")
 
     s = sp.add_parser("slideshow"); s.add_argument("--images", nargs="+", required=True)
     s.add_argument("--sec", type=float, default=4, help="har image kitne sec (voice ho to auto)"); common(s); s.set_defaults(f=cmd_slideshow)
-    s = sp.add_parser("reel"); s.add_argument("--clips", nargs="+", required=True); common(s); s.set_defaults(f=cmd_reel)
+    s = sp.add_parser("reel"); s.add_argument("--clips", nargs="+", required=True)
+    s.add_argument("--xfade", type=float, default=0, help="clips ke beech transition (sec), jaise 0.5")
+    s.add_argument("--transition", default="fade", help="fade, dissolve, wipeleft, slideleft, circleopen, ...")
+    common(s); s.set_defaults(f=cmd_reel)
     s = sp.add_parser("textcards"); s.add_argument("--script", required=True, help="har line ek card")
     s.add_argument("--sec", type=float, default=3); common(s); s.set_defaults(f=cmd_textcards)
     s = sp.add_parser("shorts"); s.add_argument("--input", required=True); s.add_argument("--outdir", default="output/shorts")
